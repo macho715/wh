@@ -409,11 +409,11 @@ class DataExtractor:
             return []
 
 # =============================================================================
-# 3. STOCK ENGINE V2 - 재고 계산 핵심 엔진
+# 3. CORRECTED STOCK ENGINE - 수정된 재고 계산 엔진
 # =============================================================================
 
 class StockEngine:
-    """HVDC 재고 계산 엔진"""
+    """수정된 HVDC 재고 계산 엔진"""
     
     @staticmethod
     def _expand_transfer(tx: pd.DataFrame) -> pd.DataFrame:
@@ -487,22 +487,25 @@ class StockEngine:
             loc_data = daily[daily['Loc'] == loc].copy()
             loc_data = loc_data.set_index('Date').sort_index()
             
-            # 날짜 범위 확장 (빈 날짜 0으로 채움)
-            if not loc_data.empty:
-                date_range = pd.date_range(
-                    start=loc_data.index.min(),
-                    end=loc_data.index.max(),
-                    freq='D'
-                )
-                loc_data = loc_data.reindex(date_range, fill_value=0)
+            # 수정된 재고 계산: Opening = 전일 Closing
+            loc_data['Opening'] = 0  # 초기값
+            loc_data['Closing'] = 0  # 초기값
             
-            # 누적 계산
-            loc_data['Opening'] = (
-                loc_data['Inbound'].cumsum() - loc_data['Outbound'].cumsum()
-            ).shift(1).fillna(0)
-            loc_data['Closing'] = (
-                loc_data['Opening'] + loc_data['Inbound'] - loc_data['Outbound']
-            )
+            for i in range(len(loc_data)):
+                if i == 0:
+                    # 첫 번째 날: Opening = 0, Closing = Inbound - Outbound
+                    loc_data.iloc[i, loc_data.columns.get_loc('Opening')] = 0
+                    loc_data.iloc[i, loc_data.columns.get_loc('Closing')] = (
+                        loc_data.iloc[i]['Inbound'] - loc_data.iloc[i]['Outbound']
+                    )
+                else:
+                    # 이후 날들: Opening = 전일 Closing, Closing = Opening + Inbound - Outbound
+                    prev_closing = loc_data.iloc[i-1]['Closing']
+                    loc_data.iloc[i, loc_data.columns.get_loc('Opening')] = prev_closing
+                    loc_data.iloc[i, loc_data.columns.get_loc('Closing')] = (
+                        prev_closing + loc_data.iloc[i]['Inbound'] - loc_data.iloc[i]['Outbound']
+                    )
+            
             loc_data['Loc'] = loc
             
             snapshots.append(loc_data.reset_index().rename(columns={'index': 'Date'}))
@@ -512,6 +515,219 @@ class StockEngine:
             return result[['Loc', 'Date', 'Opening', 'Inbound', 'Outbound', 'Closing', 'SQM']].sort_values(['Loc', 'Date'])
         else:
             return pd.DataFrame()
+    
+    @staticmethod
+    def create_proper_monthly_warehouse_analysis(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+        """올바른 창고별 월별 입출고 재고 분석"""
+        
+        if df.empty:
+            return {}
+        
+        # 1. 트랜잭션 정규화 (각 이벤트를 별도 행으로)
+        transactions = []
+        
+        for _, row in df.iterrows():
+            case_no = row['Case_No']
+            qty = row['Qty']
+            sqm = row['SQM']
+            
+            # 창고 입고 이벤트들
+            if pd.notna(row.get('Loc_To')):
+                transactions.append({
+                    'Case_No': case_no,
+                    'Date': pd.to_datetime(row['Date']),
+                    'YearMonth': pd.to_datetime(row['Date']).strftime('%Y-%m'),
+                    'Location': row['Loc_To'],
+                    'TxType': 'IN',
+                    'Qty': qty,
+                    'SQM': sqm
+                })
+            
+            # 창고 출고 이벤트들 (사이트로 배송)
+            if pd.notna(row.get('Site')) and row['TxType'] == 'OUT':
+                # 출고는 마지막 창고에서 발생
+                last_warehouse = row.get('Loc_From', 'UNKNOWN')
+                transactions.append({
+                    'Case_No': case_no,
+                    'Date': pd.to_datetime(row['Date']),
+                    'YearMonth': pd.to_datetime(row['Date']).strftime('%Y-%m'),
+                    'Location': last_warehouse,
+                    'TxType': 'OUT',
+                    'Qty': qty,
+                    'SQM': sqm
+                })
+        
+        tx_df = pd.DataFrame(transactions)
+        
+        if tx_df.empty:
+            return {}
+        
+        # 2. 월별 창고별 입출고 집계
+        monthly_summary = tx_df.groupby(['Location', 'YearMonth', 'TxType']).agg({
+            'Qty': 'sum',
+            'SQM': 'sum',
+            'Case_No': 'nunique'
+        }).reset_index()
+        
+        # 3. 입고/출고 분리
+        inbound = monthly_summary[monthly_summary['TxType'] == 'IN'].copy()
+        outbound = monthly_summary[monthly_summary['TxType'] == 'OUT'].copy()
+        
+        # 4. 전체 월 범위 생성 (빈 월 0으로 채우기)
+        all_months = sorted(tx_df['YearMonth'].unique())
+        all_locations = sorted(tx_df['Location'].unique())
+        
+        # 5. 각 창고별로 월별 재고 계산
+        stock_results = []
+        
+        for location in all_locations:
+            if location == 'UNKNOWN':
+                continue
+                
+            location_stock = []
+            opening_stock = 0  # 초기 재고
+            
+            for month in all_months:
+                # 해당 월 입고량
+                month_inbound = inbound[
+                    (inbound['Location'] == location) & 
+                    (inbound['YearMonth'] == month)
+                ]['Qty'].sum()
+                
+                # 해당 월 출고량
+                month_outbound = outbound[
+                    (outbound['Location'] == location) & 
+                    (outbound['YearMonth'] == month)
+                ]['Qty'].sum()
+                
+                # 해당 월 입고 면적
+                month_inbound_sqm = inbound[
+                    (inbound['Location'] == location) & 
+                    (inbound['YearMonth'] == month)
+                ]['SQM'].sum()
+                
+                # 해당 월 출고 면적
+                month_outbound_sqm = outbound[
+                    (outbound['Location'] == location) & 
+                    (outbound['YearMonth'] == month)
+                ]['SQM'].sum()
+                
+                # 재고 계산
+                closing_stock = opening_stock + month_inbound - month_outbound
+                
+                location_stock.append({
+                    'Location': location,
+                    'YearMonth': month,
+                    'Opening_Stock': opening_stock,
+                    'Inbound_Qty': month_inbound,
+                    'Outbound_Qty': month_outbound,
+                    'Closing_Stock': closing_stock,
+                    'Inbound_SQM': month_inbound_sqm,
+                    'Outbound_SQM': month_outbound_sqm,
+                    'Net_Movement': month_inbound - month_outbound
+                })
+                
+                # 다음 월의 opening은 이번 월의 closing
+                opening_stock = closing_stock
+            
+            stock_results.extend(location_stock)
+        
+        stock_df = pd.DataFrame(stock_results)
+        
+        # 6. 피벗 테이블들 생성
+        inbound_pivot = stock_df.pivot_table(
+            index='Location', 
+            columns='YearMonth', 
+            values='Inbound_Qty', 
+            fill_value=0
+        ).reset_index()
+        
+        outbound_pivot = stock_df.pivot_table(
+            index='Location', 
+            columns='YearMonth', 
+            values='Outbound_Qty', 
+            fill_value=0
+        ).reset_index()
+        
+        closing_stock_pivot = stock_df.pivot_table(
+            index='Location', 
+            columns='YearMonth', 
+            values='Closing_Stock', 
+            fill_value=0
+        ).reset_index()
+        
+        # 7. 누적 통계
+        cumulative_inbound = inbound_pivot.set_index('Location').cumsum(axis=1).reset_index()
+        cumulative_outbound = outbound_pivot.set_index('Location').cumsum(axis=1).reset_index()
+        
+        return {
+            'monthly_stock_detail': stock_df,
+            'monthly_inbound_pivot': inbound_pivot,
+            'monthly_outbound_pivot': outbound_pivot,
+            'monthly_closing_stock_pivot': closing_stock_pivot,
+            'cumulative_inbound': cumulative_inbound,
+            'cumulative_outbound': cumulative_outbound,
+            'monthly_summary_raw': monthly_summary
+        }
+    
+    @staticmethod
+    def validate_stock_logic(monthly_results: Dict) -> Dict[str, Any]:
+        """재고 로직 검증"""
+        
+        if 'monthly_stock_detail' not in monthly_results:
+            return {'validation_passed': False, 'errors': ['No stock detail data']}
+        
+        stock_df = monthly_results['monthly_stock_detail']
+        errors = []
+        warnings = []
+        
+        # 1. 재고 무결성 검증
+        for _, row in stock_df.iterrows():
+            expected_closing = row['Opening_Stock'] + row['Inbound_Qty'] - row['Outbound_Qty']
+            if abs(row['Closing_Stock'] - expected_closing) > 0.01:
+                errors.append(f"Stock mismatch for {row['Location']} {row['YearMonth']}: "
+                            f"Expected {expected_closing}, Got {row['Closing_Stock']}")
+        
+        # 2. 연속성 검증 (다음 월 Opening = 이전 월 Closing)
+        for location in stock_df['Location'].unique():
+            loc_data = stock_df[stock_df['Location'] == location].sort_values('YearMonth')
+            
+            for i in range(1, len(loc_data)):
+                prev_closing = loc_data.iloc[i-1]['Closing_Stock']
+                curr_opening = loc_data.iloc[i]['Opening_Stock']
+                
+                if abs(prev_closing - curr_opening) > 0.01:
+                    errors.append(f"Continuity error for {location}: "
+                                f"Month {loc_data.iloc[i-1]['YearMonth']} closing {prev_closing} "
+                                f"!= Month {loc_data.iloc[i]['YearMonth']} opening {curr_opening}")
+        
+        # 3. 음수 재고 경고
+        negative_stock = stock_df[stock_df['Closing_Stock'] < 0]
+        if not negative_stock.empty:
+            warnings.append(f"Found {len(negative_stock)} instances of negative stock")
+        
+        # 4. 입출고 균형 검증
+        for location in stock_df['Location'].unique():
+            loc_data = stock_df[stock_df['Location'] == location]
+            total_inbound = loc_data['Inbound_Qty'].sum()
+            total_outbound = loc_data['Outbound_Qty'].sum()
+            final_stock = loc_data['Closing_Stock'].iloc[-1]
+            
+            # 총 입고 - 총 출고 = 최종 재고 (초기 재고가 0이라고 가정)
+            expected_final = total_inbound - total_outbound
+            if abs(final_stock - expected_final) > 0.01:
+                errors.append(f"Balance error for {location}: "
+                            f"Total In({total_inbound}) - Total Out({total_outbound}) "
+                            f"= {expected_final}, but final stock is {final_stock}")
+        
+        return {
+            'validation_passed': len(errors) == 0,
+            'errors': errors,
+            'warnings': warnings,
+            'total_records_checked': len(stock_df),
+            'locations_checked': stock_df['Location'].nunique(),
+            'months_checked': stock_df['YearMonth'].nunique()
+        }
     
     @staticmethod
     def stock_monthly_site(tx: pd.DataFrame) -> pd.DataFrame:
@@ -577,57 +793,9 @@ class AdvancedAnalytics:
     
     @staticmethod
     def create_warehouse_monthly_analysis(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-        """창고별 월별 상세 분석"""
-        if df.empty:
-            return {}
-        
-        warehouse_df = df[df['TxType'].isin(['IN', 'OUT'])].copy()
-        warehouse_df['YearMonth'] = pd.to_datetime(warehouse_df['Date']).dt.to_period('M').astype(str)
-        
-        # 입고 분석
-        inbound_df = warehouse_df[warehouse_df['TxType'] == 'IN']
-        monthly_inbound = inbound_df.groupby(['Loc_To', 'YearMonth']).agg({
-            'Qty': 'sum',
-            'SQM': 'sum',
-            'CBM': 'sum',
-            'Case_No': 'nunique'
-        }).reset_index().rename(columns={'Loc_To': 'Location'})
-        
-        # 출고 분석
-        outbound_df = warehouse_df[warehouse_df['TxType'] == 'OUT']
-        monthly_outbound = outbound_df.groupby(['Loc_From', 'YearMonth']).agg({
-            'Qty': 'sum',
-            'SQM': 'sum', 
-            'CBM': 'sum',
-            'Case_No': 'nunique'
-        }).reset_index().rename(columns={'Loc_From': 'Location'})
-        
-        # 피벗 테이블들
-        inbound_pivot_qty = monthly_inbound.pivot_table(
-            index='Location', columns='YearMonth', values='Qty', fill_value=0
-        ).reset_index()
-        
-        inbound_pivot_sqm = monthly_inbound.pivot_table(
-            index='Location', columns='YearMonth', values='SQM', fill_value=0
-        ).reset_index()
-        
-        outbound_pivot_qty = monthly_outbound.pivot_table(
-            index='Location', columns='YearMonth', values='Qty', fill_value=0
-        ).reset_index()
-        
-        # 누적 계산
-        cumulative_inbound = inbound_pivot_qty.set_index('Location').cumsum(axis=1).reset_index()
-        cumulative_outbound = outbound_pivot_qty.set_index('Location').cumsum(axis=1).reset_index()
-        
-        return {
-            'monthly_inbound_summary': monthly_inbound,
-            'monthly_outbound_summary': monthly_outbound,
-            'inbound_pivot_qty': inbound_pivot_qty,
-            'inbound_pivot_sqm': inbound_pivot_sqm,
-            'outbound_pivot_qty': outbound_pivot_qty,
-            'cumulative_inbound': cumulative_inbound,
-            'cumulative_outbound': cumulative_outbound
-        }
+        """창고별 월별 상세 분석 - 수정된 로직 사용"""
+        # 수정된 StockEngine의 올바른 월별 분석 로직 사용
+        return StockEngine.create_proper_monthly_warehouse_analysis(df)
     
     @staticmethod
     def create_site_delivery_analysis(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
@@ -982,8 +1150,13 @@ def find_hvdc_files() -> Dict[str, List[str]]:
         'onhand': []
     }
     
-    # 모든 xlsx 파일 스캔
-    xlsx_files = glob.glob("*.xlsx")
+    # data 폴더에서 xlsx 파일 스캔
+    data_dir = "data"
+    if os.path.exists(data_dir):
+        xlsx_files = glob.glob(os.path.join(data_dir, "*.xlsx"))
+    else:
+        # data 폴더가 없으면 현재 폴더에서 스캔
+        xlsx_files = glob.glob("*.xlsx")
     
     for file in xlsx_files:
         file_type = detect_file_type(file)
@@ -1086,6 +1259,24 @@ def main():
     warehouse_monthly = AdvancedAnalytics.create_warehouse_monthly_analysis(df)
     print(f"   창고별 월별 분석 완료")
     
+    # 수정된 로직 검증
+    print(f"\n🔍 수정된 재고 로직 검증 중...")
+    validation_result = StockEngine.validate_stock_logic(warehouse_monthly)
+    
+    if validation_result['validation_passed']:
+        print(f"   ✅ 재고 로직 검증 통과")
+    else:
+        print(f"   ⚠️ 재고 로직 검증 실패 - {len(validation_result['errors'])}개 오류 발견")
+        if validation_result['errors']:
+            print(f"   첫 번째 오류: {validation_result['errors'][0]}")
+    
+    if validation_result['warnings']:
+        print(f"   ⚠️ 경고사항: {len(validation_result['warnings'])}개")
+        for warning in validation_result['warnings']:
+            print(f"     - {warning}")
+    
+    print(f"   📋 검증 대상: {validation_result['total_records_checked']}개 기록, {validation_result['locations_checked']}개 창고, {validation_result['months_checked']}개 월")
+    
     # 현장별 배송 분석
     site_delivery = AdvancedAnalytics.create_site_delivery_analysis(df)
     print(f"   현장별 배송 분석 완료")
@@ -1118,7 +1309,7 @@ def main():
         'onhand_data': onhand_df
     }
     
-    ReportWriter.save_comprehensive_report(all_analysis_data)
+    ReportWriter.save_comprehensive_report(all_analysis_data, "reports/HVDC_Comprehensive_Report.xlsx")
     
     # 7. 결과 요약 출력
     print(f"\n📋 분석 결과 요약:")
